@@ -4,13 +4,14 @@ import asyncio
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from octopus_python.app import create_app
 from octopus_python.config import AppConfig, DatabaseConfig, LogConfig, ServerConfig
 from octopus_python.database import APIKey, Channel, LLMInfo, RelayLog, StatsHourly, close_db, init_db, session_scope
-from octopus_python.relay import merge_usage
+from octopus_python.relay import FORM_FIELDS_KEY, FORM_FILES_KEY, merge_usage, prepare_body, sanitize_request_body_for_log
 from octopus_python.schemas import ChannelCreateRequest, ChannelUpdateRequest, GroupCreateRequest, SettingRequest
 from octopus_python.services import (
     add_relay_log,
@@ -18,14 +19,17 @@ from octopus_python.services import (
     create_channel,
     create_group,
     get_stats_hourly,
+    httpx_client_options,
     init_services,
     issue_stream_token,
     list_relay_logs,
+    measure_base_url_delay,
     parse_models_dev_prices,
     record_usage,
     set_setting,
     today_str,
     update_channel,
+    update_channel_base_url_delay,
     update_model_prices,
 )
 
@@ -286,3 +290,74 @@ def test_update_model_prices_uses_models_dev_without_overwriting_custom_price(
             0.0,
             0.0,
         )
+
+
+def test_multipart_image_body_preserves_files_but_sanitizes_logs() -> None:
+    body = {
+        "model": "gpt-image-1",
+        "prompt": "edit this",
+        FORM_FIELDS_KEY: [("model", "gpt-image-1"), ("prompt", "edit this")],
+        FORM_FILES_KEY: [
+            {
+                "field": "image",
+                "filename": "input.png",
+                "content": b"binary-image",
+                "content_type": "image/png",
+            }
+        ],
+    }
+
+    prepared, converted = prepare_body("openai/images_edits", "images_edits", body, "actual-image-model")
+    assert not converted
+    assert prepared["model"] == "actual-image-model"
+    assert ("model", "actual-image-model") in prepared[FORM_FIELDS_KEY]
+    assert prepared[FORM_FILES_KEY][0]["content"] == b"binary-image"
+
+    safe = sanitize_request_body_for_log(prepared)
+    assert FORM_FILES_KEY not in safe
+    assert safe["files"] == [
+        {"field": "image", "filename": "input.png", "content_type": "image/png", "size": len(b"binary-image")}
+    ]
+
+
+def test_httpx_client_options_matches_go_proxy_rules(client: TestClient) -> None:
+    set_setting(SettingRequest(key="proxy_url", value="http://127.0.0.1:8888"))
+    assert httpx_client_options(proxy_enabled=False) == {"trust_env": False}
+    assert httpx_client_options(proxy_enabled=True, channel_proxy="http://127.0.0.1:9999") == {
+        "proxy": "http://127.0.0.1:9999",
+        "trust_env": False,
+    }
+    assert httpx_client_options(proxy_enabled=True) == {"proxy": "http://127.0.0.1:8888", "trust_env": False}
+
+
+def test_base_url_delay_update_persists_measured_delay(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    channel = create_channel(
+        ChannelCreateRequest(
+            name="delay-channel",
+            type="openai/chat_completions",
+            base_urls=[{"url": "https://example.com/v1", "delay": 0}],
+            model="gpt-delay",
+        )
+    )
+
+    async def fake_measure(url: str, client_options: dict[str, object] | None = None) -> int:
+        assert url == "https://example.com/v1"
+        assert client_options == {"trust_env": False}
+        return 123
+
+    monkeypatch.setattr("octopus_python.services.measure_base_url_delay", fake_measure)
+    asyncio.run(update_channel_base_url_delay(channel["id"]))
+
+    with session_scope() as session:
+        stored = session.get(Channel, channel["id"])
+        assert stored is not None
+        assert stored.base_urls[0]["delay"] == 123
+
+
+def test_measure_base_url_delay_uses_httpx_transport() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok")
+
+    transport = httpx.MockTransport(handler)
+    delay = asyncio.run(measure_base_url_delay("https://example.com", {"transport": transport, "trust_env": False}))
+    assert delay >= 1

@@ -21,10 +21,14 @@ from .services import (
     choose_channel_key,
     circuit_breakers,
     get_setting_int,
+    httpx_client_options,
     record_usage,
     round_robin_counters,
     sticky_sessions,
 )
+
+FORM_FIELDS_KEY = "__octopus_form_fields__"
+FORM_FILES_KEY = "__octopus_form_files__"
 
 
 class RelayError(Exception):
@@ -56,6 +60,30 @@ def truncate_json(value: Any, max_len: int = 12000) -> str:
     if len(text) > max_len:
         return text[:max_len] + "...<truncated>"
     return text
+
+
+def is_form_body(body: dict[str, Any]) -> bool:
+    return FORM_FIELDS_KEY in body or FORM_FILES_KEY in body
+
+
+def sanitize_request_body_for_log(body: dict[str, Any]) -> dict[str, Any]:
+    if not is_form_body(body):
+        return body
+    safe = {k: v for k, v in body.items() if k not in {FORM_FIELDS_KEY, FORM_FILES_KEY}}
+    files = []
+    for item in body.get(FORM_FILES_KEY, []) or []:
+        if isinstance(item, dict):
+            files.append(
+                {
+                    "field": item.get("field", ""),
+                    "filename": item.get("filename", ""),
+                    "content_type": item.get("content_type", ""),
+                    "size": len(item.get("content") or b""),
+                }
+            )
+    if files:
+        safe["files"] = files
+    return safe
 
 
 def merge_usage(current: tuple[int, int], chunk: bytes) -> tuple[int, int]:
@@ -227,6 +255,10 @@ def anthropic_to_openai(data: dict[str, Any], model: str) -> dict[str, Any]:
 def prepare_body(channel_type: str, endpoint: str, body: dict[str, Any], actual_model: str) -> tuple[dict[str, Any], bool]:
     out = dict(body)
     out["model"] = actual_model
+    if is_form_body(out):
+        fields = [(str(k), str(v)) for k, v in (out.get(FORM_FIELDS_KEY) or []) if k != "model"]
+        fields.append(("model", actual_model))
+        out[FORM_FIELDS_KEY] = fields
     converted = False
     if channel_type == "gemini/contents" and endpoint in {"chat", "responses"}:
         return to_gemini_payload(out), True
@@ -427,10 +459,13 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
                 continue
             upstream_body, converted = prepare_body(channel.type, endpoint, body, actual_model)
             override = safe_json_loads(channel.param_override, {})
-            if isinstance(override, dict):
+            if isinstance(override, dict) and not is_form_body(upstream_body):
                 upstream_body = merge_dict(upstream_body, override)
             url = build_upstream_url(channel.type, base, endpoint, actual_model)
             headers = prepare_headers(channel.type, channel_key.channel_key, channel.custom_header or [], request)
+            client_options = httpx_client_options(
+                proxy_enabled=bool(channel.proxy), channel_proxy=channel.channel_proxy or "", session=session
+            )
             try:
                 duration_start = time.time()
                 if bool(upstream_body.get("stream")) and not endpoint.startswith("images_"):
@@ -439,6 +474,7 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
                         headers=headers,
                         body=upstream_body,
                         first_token_timeout=group.first_token_time_out or 0,
+                        client_options=client_options,
                     )
                     duration = int((time.time() - duration_start) * 1000)
                     attempt["duration"] = duration
@@ -494,6 +530,7 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
                     channel_type=channel.type,
                     endpoint=endpoint,
                     actual_model=actual_model,
+                    client_options=client_options,
                 )
                 duration = int((time.time() - duration_start) * 1000)
                 attempt["duration"] = duration
@@ -538,7 +575,7 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
                     "ftut": 0,
                     "use_time": use_time,
                     "cost": cost,
-                    "request_content": truncate_json(body),
+                    "request_content": truncate_json(sanitize_request_body_for_log(body)),
                     "response_content": truncate_json(result if result is not None else raw_bytes.decode("utf-8", "ignore")),
                     "error": "",
                     "attempts": attempts,
@@ -586,7 +623,7 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
             "ftut": 0,
             "use_time": int((time.time() - start) * 1000),
             "cost": 0.0,
-            "request_content": truncate_json(body),
+            "request_content": truncate_json(sanitize_request_body_for_log(body)),
             "response_content": "",
             "error": last_error or "all channel attempts failed",
             "attempts": attempts,
@@ -603,10 +640,26 @@ async def parse_any_body(request: Request) -> dict[str, Any]:
     if "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype:
         form = await request.form()
         out: dict[str, Any] = {}
+        fields: list[tuple[str, str]] = []
+        files: list[dict[str, Any]] = []
         for key, value in form.multi_items():
             if hasattr(value, "filename"):
-                continue
-            out[key] = value
+                content = await value.read()
+                files.append(
+                    {
+                        "field": key,
+                        "filename": value.filename or "upload",
+                        "content": content,
+                        "content_type": getattr(value, "content_type", None) or "application/octet-stream",
+                    }
+                )
+            else:
+                text_value = str(value)
+                fields.append((key, text_value))
+                out[key] = text_value
+        out[FORM_FIELDS_KEY] = fields
+        if files:
+            out[FORM_FILES_KEY] = files
         return out
     try:
         return await request.json()
@@ -623,13 +676,30 @@ async def forward_request(
     channel_type: str,
     endpoint: str,
     actual_model: str,
+    client_options: dict[str, Any] | None = None,
 ) -> tuple[Any, bytes, int, str]:
     stream = bool(body.get("stream")) and not endpoint.startswith("images_")
     timeout = httpx.Timeout(300.0, connect=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, **(client_options or {})) as client:
         if stream:
             # Non-buffered upstream streaming. Logs cannot know final usage here, but response is preserved.
             res = await client.post(url, headers=headers, json=body)
+        elif is_form_body(body):
+            multipart_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            data = [(str(k), str(v)) for k, v in body.get(FORM_FIELDS_KEY, [])]
+            files = [
+                (
+                    str(item.get("field") or "file"),
+                    (
+                        str(item.get("filename") or "upload"),
+                        item.get("content") or b"",
+                        str(item.get("content_type") or "application/octet-stream"),
+                    ),
+                )
+                for item in body.get(FORM_FILES_KEY, [])
+                if isinstance(item, dict)
+            ]
+            res = await client.post(url, headers=multipart_headers, data=data, files=files or None)
         else:
             res = await client.post(url, headers=headers, json=body)
     raw = res.content
@@ -658,9 +728,10 @@ async def open_stream_with_first_chunk(
     headers: dict[str, str],
     body: dict[str, Any],
     first_token_timeout: int,
+    client_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timeout = httpx.Timeout(None, connect=30.0, read=None, write=30.0, pool=30.0)
-    client = httpx.AsyncClient(timeout=timeout)
+    client = httpx.AsyncClient(timeout=timeout, **(client_options or {}))
     response: httpx.Response | None = None
     try:
         request = client.build_request("POST", url, headers=headers, json=body)
@@ -835,7 +906,7 @@ def finalize_stream_relay(
             "ftut": ftut,
             "use_time": use_time,
             "cost": cost,
-            "request_content": truncate_json(request_body),
+            "request_content": truncate_json(sanitize_request_body_for_log(request_body)),
             "response_content": response_text[:12000],
             "error": error,
             "attempts": attempts,

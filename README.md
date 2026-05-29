@@ -2,6 +2,9 @@
 
 這是原 `octopus/` Go 專案的 Python/FastAPI 移植版，預設放在 `./octopus-python`。
 
+- 原版 Go 倉庫：<https://github.com/bestruirui/octopus>
+- Python 版倉庫：<https://github.com/s12ryt/octopus-python>
+
 目前移植範圍：
 
 - FastAPI 服務與 `/api/v1/*` 管理 API
@@ -79,11 +82,13 @@ Python 版已將 Go 專案的 Web UI 建置後產物移植到 `static/out`，啟
 - Channel 更新保留明確傳入的 `0`/`false`，避免 `auto_group=0` 被誤寫成空字串。
 - 密碼雜湊使用 `bcrypt` 套件直接實作，避免 Python 3.14 + passlib/bcrypt 5 的相容性問題。
 - 串流 relay 已支援 SSE passthrough、首 token timeout 後切換下一個 channel、stream usage 解析與 relay log 補寫。
-- FastAPI lifespan 會啟動背景維護 task：從 `models.dev` 自動抓取模型價格、channel 模型同步、relay log retention 清理。
+- Image edits/variations 支援 multipart 表單與檔案 passthrough，relay log 只記錄檔名、類型與大小，不落庫圖片二進位內容。
+- Channel proxy 行為對齊 Go 版：可關閉環境 proxy、使用全域 `proxy_url`，或使用 channel 自訂 proxy。
+- FastAPI lifespan 會啟動背景維護 task：啟動即執行 `models.dev` 價格同步、channel 模型同步、base URL delay 量測，並定期清理 relay log retention。
 - 價格同步遵循「手動價格優先」：非 0 的使用者自訂價格不會被覆蓋，未定價或新 channel model 會自動補入 `models.dev` 價格。
 
 ## 注意
 
 Python 版不依賴 Go 專案的 `axonhub`，relay 採「協議相容的 HTTP 轉發 + 常用格式轉換」實作；複雜串流 usage 補齊與完整 provider 特例行為可能與 Go 版仍有細節差異。
 
-目前已支援 OpenAI Chat/Responses/Embeddings/Images、Anthropic Messages、Gemini Contents 的常用轉換與 endpoint 選擇。串流已改為 passthrough 並補上首 token timeout 與 usage/log 聚合；少數 provider 專屬串流事件格式仍採 best-effort 解析。
+目前已支援 OpenAI Chat/Responses/Embeddings/Images、Anthropic Messages、Gemini Contents 的常用轉換與 endpoint 選擇。串流已改為 passthrough 並補上首 token timeout 與 usage/log 聚合；少數 provider 專屬串流事件格式仍採 best-effort 解析，尚未完整等同 Go 版 axonhub transformer pipeline。

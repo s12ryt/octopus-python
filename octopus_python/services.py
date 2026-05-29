@@ -90,6 +90,7 @@ CHANNEL_PATHS = {
     "gemini/contents": "",
     "doubao": "/chat/completions",
 }
+BASE_URL_DELAY_INTERVAL_SECONDS = 3600
 
 last_model_update_time = ""
 last_channel_sync_time = ""
@@ -162,6 +163,7 @@ async def start_background_tasks() -> None:
     for coro in [
         _periodic_model_price_sync(),
         _periodic_channel_sync(),
+        _periodic_base_url_delay_update(),
         _periodic_relay_log_cleanup(),
     ]:
         task = asyncio.create_task(coro)
@@ -194,12 +196,14 @@ async def _sleep_or_stop(seconds: float) -> bool:
 
 
 async def _periodic_model_price_sync() -> None:
+    first_run = True
     while True:
         try:
             with session_scope() as session:
                 interval_hours = max(get_setting_int(session, "model_info_update_interval", 24), 1)
-            if await _sleep_or_stop(interval_hours * 3600):
+            if not first_run and await _sleep_or_stop(interval_hours * 3600):
                 return
+            first_run = False
             await update_model_prices()
         except asyncio.CancelledError:
             raise
@@ -208,12 +212,14 @@ async def _periodic_model_price_sync() -> None:
 
 
 async def _periodic_channel_sync() -> None:
+    first_run = True
     while True:
         try:
             with session_scope() as session:
                 interval_hours = max(get_setting_int(session, "sync_llm_interval", 24), 1)
-            if await _sleep_or_stop(interval_hours * 3600):
+            if not first_run and await _sleep_or_stop(interval_hours * 3600):
                 return
+            first_run = False
             await sync_channels()
         except asyncio.CancelledError:
             raise
@@ -227,6 +233,20 @@ async def _periodic_relay_log_cleanup() -> None:
             if await _sleep_or_stop(3600):
                 return
             cleanup_old_relay_logs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await _sleep_or_stop(60)
+
+
+async def _periodic_base_url_delay_update() -> None:
+    first_run = True
+    while True:
+        try:
+            if not first_run and await _sleep_or_stop(BASE_URL_DELAY_INTERVAL_SECONDS):
+                return
+            first_run = False
+            await update_all_channel_base_url_delays()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -279,6 +299,31 @@ def validate_setting(req: SettingRequest) -> None:
     if req.key == "proxy_url" and req.value:
         if not re.match(r"^(https?|socks5)://[^\s/$.?#].[^\s]*$", req.value):
             raise ValueError("proxy_url must be empty or valid http/https/socks5 URL")
+
+
+def httpx_client_options(
+    *,
+    proxy_enabled: bool,
+    channel_proxy: str = "",
+    session: Session | None = None,
+) -> dict[str, Any]:
+    """Mirror Go ChannelHttpClient proxy selection for httpx clients.
+
+    proxy=false disables environment proxy. proxy=true uses channel_proxy first,
+    then the global proxy_url setting, otherwise httpx environment proxy.
+    """
+    if not proxy_enabled:
+        return {"trust_env": False}
+    proxy_url = (channel_proxy or "").strip()
+    if not proxy_url:
+        if session is not None:
+            proxy_url = get_setting(session, "proxy_url", "").strip()
+        else:
+            with session_scope() as local_session:
+                proxy_url = get_setting(local_session, "proxy_url", "").strip()
+    if proxy_url:
+        return {"proxy": proxy_url, "trust_env": False}
+    return {"trust_env": True}
 
 
 def list_settings() -> list[dict[str, Any]]:
@@ -623,6 +668,56 @@ def choose_base_url(channel: Channel | dict[str, Any]) -> str:
     return min(candidates, key=lambda x: x.get("delay", 0) or 0)["url"].rstrip("/")
 
 
+async def measure_base_url_delay(url: str, client_options: dict[str, Any] | None = None) -> int:
+    target = (url or "").rstrip("/")
+    if not target:
+        return 0
+    start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), **(client_options or {})) as client:
+            try:
+                response = await client.head(target)
+                if response.status_code == 405:
+                    response = await client.get(target)
+            except httpx.HTTPError:
+                response = await client.get(target)
+            await response.aread()
+        return max(int((time.perf_counter() - start) * 1000), 1)
+    except Exception:
+        return 0
+
+
+async def update_channel_base_url_delay(channel_id: int) -> None:
+    with session_scope() as session:
+        channel = session.get(Channel, channel_id)
+        if channel is None:
+            return
+        base_urls = [dict(item) for item in (channel.base_urls or []) if isinstance(item, dict)]
+        client_options = httpx_client_options(
+            proxy_enabled=bool(channel.proxy), channel_proxy=channel.channel_proxy or "", session=session
+        )
+    changed = False
+    for item in base_urls:
+        if not item.get("url"):
+            continue
+        delay = await measure_base_url_delay(str(item["url"]), client_options)
+        if delay and item.get("delay") != delay:
+            item["delay"] = delay
+            changed = True
+    if changed:
+        with session_scope() as session:
+            channel = session.get(Channel, channel_id)
+            if channel is not None:
+                channel.base_urls = base_urls
+
+
+async def update_all_channel_base_url_delays() -> None:
+    with session_scope() as session:
+        channel_ids = list(session.scalars(select(Channel.id).order_by(Channel.id)).all())
+    for channel_id in channel_ids:
+        await update_channel_base_url_delay(channel_id)
+
+
 def choose_channel_key(channel: Channel) -> ChannelKey | None:
     now = int(time.time())
     keys = [k for k in channel.keys if k.enabled and k.channel_key]
@@ -921,7 +1016,8 @@ async def fetch_models(req: FetchModelRequest) -> list[str]:
         if h.header_key and h.header_key.lower() not in SENSITIVE_HEADERS:
             headers[h.header_key] = h.header_value
     try:
-        async with httpx.AsyncClient(timeout=20, proxy=req.channel_proxy or None) as client:
+        client_options = httpx_client_options(proxy_enabled=bool(req.proxy), channel_proxy=req.channel_proxy or "")
+        async with httpx.AsyncClient(timeout=20, **client_options) as client:
             if req.type == "anthropic/messages":
                 headers.pop("Authorization", None)
                 headers["x-api-key"] = key
