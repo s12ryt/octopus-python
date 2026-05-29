@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -71,7 +72,9 @@ from .services import (
     list_settings,
     relay_subscribers,
     set_setting,
+    start_background_tasks,
     sync_channels,
+    stop_background_tasks,
     update_api_key,
     update_channel,
     update_core,
@@ -184,7 +187,15 @@ def _allowed_origin(origin: str | None) -> bool:
 
 
 def create_app(config: AppConfig) -> FastAPI:
-    app = FastAPI(title="Octopus Python", version=VERSION)
+    @asynccontextmanager
+    async def lifespan(app_: FastAPI):
+        await start_background_tasks()
+        try:
+            yield
+        finally:
+            await stop_background_tasks()
+
+    app = FastAPI(title="Octopus Python", version=VERSION, lifespan=lifespan)
     register_exception_handlers(app)
 
     # Let the original setting decide CORS at request time. Empty setting denies browser CORS, same as Go middleware.

@@ -78,9 +78,11 @@ Python 版已將 Go 專案的 Web UI 建置後產物移植到 `static/out`，啟
 - 統計日期採 `YYYYMMDD`，小時統計採 0..23，並補齊今日缺漏小時。
 - Channel 更新保留明確傳入的 `0`/`false`，避免 `auto_group=0` 被誤寫成空字串。
 - 密碼雜湊使用 `bcrypt` 套件直接實作，避免 Python 3.14 + passlib/bcrypt 5 的相容性問題。
+- 串流 relay 已支援 SSE passthrough、首 token timeout 後切換下一個 channel、stream usage 解析與 relay log 補寫。
+- FastAPI lifespan 會啟動背景維護 task：模型價格補齊、channel 模型同步、relay log retention 清理。
 
 ## 注意
 
 Python 版不依賴 Go 專案的 `axonhub`，relay 採「協議相容的 HTTP 轉發 + 常用格式轉換」實作；複雜串流 usage 補齊與完整 provider 特例行為可能與 Go 版仍有細節差異。
 
-目前已支援 OpenAI Chat/Responses/Embeddings/Images、Anthropic Messages、Gemini Contents 的常用轉換與 endpoint 選擇；但串流 relay 仍以 HTTP buffered 轉發為主，尚未完整複製 Go 版首 token timeout、SSE passthrough 與 usage 聚合的所有細節。
+目前已支援 OpenAI Chat/Responses/Embeddings/Images、Anthropic Messages、Gemini Contents 的常用轉換與 endpoint 選擇。串流已改為 passthrough 並補上首 token timeout 與 usage/log 聚合；少數 provider 專屬串流事件格式仍採 best-effort 解析。

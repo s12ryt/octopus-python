@@ -5,7 +5,7 @@ import random
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
@@ -85,6 +85,8 @@ relay_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 round_robin_counters: defaultdict[int, int] = defaultdict(int)
 sticky_sessions: dict[str, tuple[int, int, float]] = {}
 circuit_breakers: dict[str, dict[str, Any]] = {}
+background_tasks: set[asyncio.Task[Any]] = set()
+background_stop_event: asyncio.Event | None = None
 
 
 def _normalize_base_url(base_url: str, suffix: str = "v1") -> str:
@@ -130,11 +132,91 @@ async def init_services() -> None:
 
 
 async def shutdown_services() -> None:
-    return None
+    await stop_background_tasks()
 
 
 def save_runtime_state() -> None:
     return None
+
+
+async def start_background_tasks() -> None:
+    """Start lightweight Go-like maintenance loops on the running ASGI event loop."""
+    global background_stop_event
+    if background_tasks:
+        return
+    background_stop_event = asyncio.Event()
+    for coro in [
+        _periodic_model_price_sync(),
+        _periodic_channel_sync(),
+        _periodic_relay_log_cleanup(),
+    ]:
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+
+async def stop_background_tasks() -> None:
+    global background_stop_event
+    if background_stop_event is not None:
+        background_stop_event.set()
+    tasks = list(background_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    background_tasks.clear()
+    background_stop_event = None
+
+
+async def _sleep_or_stop(seconds: float) -> bool:
+    event = background_stop_event
+    if event is None:
+        return True
+    try:
+        await asyncio.wait_for(event.wait(), timeout=max(seconds, 0.1))
+        return True
+    except TimeoutError:
+        return False
+
+
+async def _periodic_model_price_sync() -> None:
+    while True:
+        try:
+            with session_scope() as session:
+                interval_hours = max(get_setting_int(session, "model_info_update_interval", 24), 1)
+            if await _sleep_or_stop(interval_hours * 3600):
+                return
+            await update_model_prices()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await _sleep_or_stop(60)
+
+
+async def _periodic_channel_sync() -> None:
+    while True:
+        try:
+            with session_scope() as session:
+                interval_hours = max(get_setting_int(session, "sync_llm_interval", 24), 1)
+            if await _sleep_or_stop(interval_hours * 3600):
+                return
+            await sync_channels()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await _sleep_or_stop(60)
+
+
+async def _periodic_relay_log_cleanup() -> None:
+    while True:
+        try:
+            if await _sleep_or_stop(3600):
+                return
+            cleanup_old_relay_logs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await _sleep_or_stop(60)
 
 
 def ensure_settings(session: Session) -> None:
@@ -959,6 +1041,17 @@ def list_relay_logs(page: int = 1, page_size: int = 20, start_time: int | None =
 def clear_relay_logs() -> None:
     with session_scope() as session:
         session.execute(delete(RelayLog))
+
+
+def cleanup_old_relay_logs() -> int:
+    with session_scope() as session:
+        enabled = get_setting(session, "relay_log_keep_enabled", "true").lower() == "true"
+        if not enabled:
+            return 0
+        keep_days = max(get_setting_int(session, "relay_log_keep_period", 7), 1)
+        cutoff = int((datetime.now() - timedelta(days=keep_days)).timestamp())
+        result = session.execute(delete(RelayLog).where(RelayLog.time < cutoff))
+        return int(result.rowcount or 0)
 
 
 def issue_stream_token() -> str:

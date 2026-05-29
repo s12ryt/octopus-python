@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from .database import Channel, Group, GroupItem, session_scope
+from .database import Channel, ChannelKey, Group, GroupItem, session_scope
 from .schemas import RelayContext, merge_dict, safe_json_loads, split_csv
 from .services import (
     SENSITIVE_HEADERS,
@@ -55,6 +56,43 @@ def truncate_json(value: Any, max_len: int = 12000) -> str:
     if len(text) > max_len:
         return text[:max_len] + "...<truncated>"
     return text
+
+
+def merge_usage(current: tuple[int, int], chunk: bytes) -> tuple[int, int]:
+    prompt, completion = current
+    text = chunk.decode("utf-8", errors="ignore")
+    payloads: list[Any] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            payloads.append(json.loads(line))
+        except Exception:
+            continue
+    if not payloads:
+        try:
+            payloads.append(json.loads(text))
+        except Exception:
+            return prompt, completion
+    for payload in payloads:
+        p, c = extract_usage(payload)
+        prompt = max(prompt, p)
+        completion = max(completion, c)
+        if isinstance(payload, dict):
+            if payload.get("type") == "message_start":
+                usage = (payload.get("message") or {}).get("usage") or {}
+                prompt = max(prompt, int(usage.get("input_tokens") or 0))
+            elif payload.get("type") == "message_delta":
+                usage = payload.get("usage") or {}
+                completion = max(completion, int(usage.get("output_tokens") or 0))
+            usage = payload.get("usageMetadata") or {}
+            if usage:
+                prompt = max(prompt, int(usage.get("promptTokenCount") or 0))
+                completion = max(completion, int(usage.get("candidatesTokenCount") or 0))
+    return prompt, completion
 
 
 def build_upstream_url(channel_type: str, base_url: str, endpoint: str, model_name: str = "") -> str:
@@ -395,6 +433,59 @@ async def handle_relay(request: Request, endpoint: str, ctx: RelayContext) -> Re
             headers = prepare_headers(channel.type, channel_key.channel_key, channel.custom_header or [], request)
             try:
                 duration_start = time.time()
+                if bool(upstream_body.get("stream")) and not endpoint.startswith("images_"):
+                    stream_open = await open_stream_with_first_chunk(
+                        url=url,
+                        headers=headers,
+                        body=upstream_body,
+                        first_token_timeout=group.first_token_time_out or 0,
+                    )
+                    duration = int((time.time() - duration_start) * 1000)
+                    attempt["duration"] = duration
+                    if stream_open["error"]:
+                        attempt["msg"] = stream_open["error"]
+                        last_error = stream_open["error"]
+                        mark_circuit(session, channel.id, channel_key.id, actual_model, False)
+                        attempts.append(attempt)
+                        continue
+                    status_code = int(stream_open["status_code"])
+                    success = 200 <= status_code < 400
+                    attempt["status"] = "success" if success else "failed"
+                    if not success:
+                        attempt["msg"] = (stream_open["error_body"] or "upstream stream failed")[:500]
+                        last_error = attempt["msg"]
+                        channel_key.status_code = status_code
+                        channel_key.last_use_time_stamp = int(time.time())
+                        mark_circuit(session, channel.id, channel_key.id, actual_model, False)
+                        attempts.append(attempt)
+                        continue
+
+                    channel_key.status_code = status_code
+                    channel_key.last_use_time_stamp = int(time.time())
+                    mark_circuit(session, channel.id, channel_key.id, actual_model, True)
+                    sticky_sessions[f"{ctx.api_key_id}:{request_model}"] = (channel.id, channel_key.id, time.time())
+                    attempts.append(attempt)
+                    session.flush()
+                    first_chunk = stream_open["first_chunk"]
+                    response = stream_open["response"]
+                    client = stream_open["client"]
+                    media_type = stream_open["media_type"]
+                    return build_streaming_response(
+                        first_chunk=first_chunk,
+                        upstream_response=response,
+                        client=client,
+                        media_type=media_type,
+                        request_body=body,
+                        ctx=ctx,
+                        request_model=request_model,
+                        channel_id=channel.id,
+                        channel_key_id=channel_key.id,
+                        channel_name=channel.name,
+                        actual_model=actual_model,
+                        attempts=attempts,
+                        start=start,
+                        ftut=duration,
+                    )
                 result, raw_bytes, status_code, media_type = await forward_request(
                     request=request,
                     url=url,
@@ -559,6 +650,198 @@ async def forward_request(
             raw = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
             media_type = "application/json"
     return parsed, raw, res.status_code, media_type
+
+
+async def open_stream_with_first_chunk(
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    first_token_timeout: int,
+) -> dict[str, Any]:
+    timeout = httpx.Timeout(None, connect=30.0, read=None, write=30.0, pool=30.0)
+    client = httpx.AsyncClient(timeout=timeout)
+    response: httpx.Response | None = None
+    try:
+        request = client.build_request("POST", url, headers=headers, json=body)
+        response = await client.send(request, stream=True)
+        media_type = response.headers.get("content-type", "text/event-stream")
+        if not (200 <= response.status_code < 400):
+            error_body = (await response.aread()).decode("utf-8", errors="ignore")
+            await response.aclose()
+            await client.aclose()
+            return {
+                "client": None,
+                "response": None,
+                "first_chunk": b"",
+                "status_code": response.status_code,
+                "media_type": media_type,
+                "error": "",
+                "error_body": error_body,
+            }
+        iterator = response.aiter_bytes()
+        wait_seconds = first_token_timeout if first_token_timeout > 0 else None
+        try:
+            if wait_seconds is None:
+                first_chunk = await anext(iterator)
+            else:
+                first_chunk = await asyncio.wait_for(anext(iterator), timeout=wait_seconds)
+        except TimeoutError:
+            await response.aclose()
+            await client.aclose()
+            return {
+                "client": None,
+                "response": None,
+                "first_chunk": b"",
+                "status_code": response.status_code,
+                "media_type": media_type,
+                "error": f"first token timeout after {first_token_timeout}s",
+                "error_body": "",
+            }
+        except StopAsyncIteration:
+            first_chunk = b""
+        response._octopus_iterator = iterator  # type: ignore[attr-defined]
+        return {
+            "client": client,
+            "response": response,
+            "first_chunk": first_chunk,
+            "status_code": response.status_code,
+            "media_type": media_type,
+            "error": "",
+            "error_body": "",
+        }
+    except Exception as exc:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        return {
+            "client": None,
+            "response": None,
+            "first_chunk": b"",
+            "status_code": 0,
+            "media_type": "text/event-stream",
+            "error": str(exc),
+            "error_body": "",
+        }
+
+
+def build_streaming_response(
+    *,
+    first_chunk: bytes,
+    upstream_response: httpx.Response,
+    client: httpx.AsyncClient,
+    media_type: str,
+    request_body: dict[str, Any],
+    ctx: RelayContext,
+    request_model: str,
+    channel_id: int,
+    channel_key_id: int,
+    channel_name: str,
+    actual_model: str,
+    attempts: list[dict[str, Any]],
+    start: float,
+    ftut: int,
+) -> StreamingResponse:
+    async def events() -> AsyncIterator[bytes]:
+        usage = (0, 0)
+        response_chunks: list[str] = []
+        error = ""
+        try:
+            if first_chunk:
+                usage = merge_usage(usage, first_chunk)
+                response_chunks.append(first_chunk.decode("utf-8", errors="ignore"))
+                yield first_chunk
+            iterator = getattr(upstream_response, "_octopus_iterator", upstream_response.aiter_bytes())
+            async for chunk in iterator:
+                usage = merge_usage(usage, chunk)
+                if sum(len(x) for x in response_chunks) < 12000:
+                    response_chunks.append(chunk.decode("utf-8", errors="ignore"))
+                yield chunk
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            await upstream_response.aclose()
+            await client.aclose()
+            finalize_stream_relay(
+                ctx=ctx,
+                request_model=request_model,
+                channel_id=channel_id,
+                channel_key_id=channel_key_id,
+                channel_name=channel_name,
+                actual_model=actual_model,
+                prompt_tokens=usage[0],
+                completion_tokens=usage[1],
+                ftut=ftut,
+                use_time=int((time.time() - start) * 1000),
+                request_body=request_body,
+                response_text="".join(response_chunks),
+                error=error,
+                attempts=attempts,
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type=media_type or "text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+def finalize_stream_relay(
+    *,
+    ctx: RelayContext,
+    request_model: str,
+    channel_id: int,
+    channel_key_id: int,
+    channel_name: str,
+    actual_model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    ftut: int,
+    use_time: int,
+    request_body: dict[str, Any],
+    response_text: str,
+    error: str,
+    attempts: list[dict[str, Any]],
+) -> None:
+    with session_scope() as session:
+        cost = record_usage(
+            session,
+            api_key_id=ctx.api_key_id,
+            channel_id=channel_id,
+            actual_model=actual_model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            wait_time=use_time,
+            success=not error,
+        )
+        if channel_key_id:
+            key = session.get(ChannelKey, channel_key_id)
+            if key is not None:
+                key.total_cost = (key.total_cost or 0) + cost
+                key.last_use_time_stamp = int(time.time())
+        session.flush()
+    add_relay_log(
+        {
+            "id": 0,
+            "time": int(time.time()),
+            "request_model_name": request_model,
+            "request_api_key_name": ctx.api_key_name,
+            "channel": channel_id,
+            "channel_name": channel_name,
+            "actual_model_name": actual_model,
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "ftut": ftut,
+            "use_time": use_time,
+            "cost": cost,
+            "request_content": truncate_json(request_body),
+            "response_content": response_text[:12000],
+            "error": error,
+            "attempts": attempts,
+            "total_attempts": len(attempts),
+        }
+    )
 
 
 def build_downstream_response(

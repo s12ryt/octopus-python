@@ -9,10 +9,12 @@ from fastapi.testclient import TestClient
 
 from octopus_python.app import create_app
 from octopus_python.config import AppConfig, DatabaseConfig, LogConfig, ServerConfig
-from octopus_python.database import APIKey, Channel, StatsHourly, close_db, init_db, session_scope
-from octopus_python.schemas import ChannelCreateRequest, ChannelUpdateRequest, GroupCreateRequest
+from octopus_python.database import APIKey, Channel, RelayLog, StatsHourly, close_db, init_db, session_scope
+from octopus_python.relay import merge_usage
+from octopus_python.schemas import ChannelCreateRequest, ChannelUpdateRequest, GroupCreateRequest, SettingRequest
 from octopus_python.services import (
     add_relay_log,
+    cleanup_old_relay_logs,
     create_channel,
     create_group,
     get_stats_hourly,
@@ -20,6 +22,7 @@ from octopus_python.services import (
     issue_stream_token,
     list_relay_logs,
     record_usage,
+    set_setting,
     today_str,
     update_channel,
 )
@@ -196,3 +199,34 @@ def test_stream_token_is_one_time_and_model_list_auth(client: TestClient) -> Non
     response = client.get("/v1/models", headers={"Authorization": "Bearer sk-octopus-testkey"})
     assert response.status_code == 200
     assert response.json()["object"] == "list"
+
+
+def test_stream_usage_parser_supports_openai_and_anthropic_chunks(client: TestClient) -> None:
+    usage = merge_usage((0, 0), b'data: {"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n')
+    assert usage == (3, 5)
+    usage = merge_usage(
+        usage,
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}\n\n'
+        b'data: {"type":"message_delta","usage":{"output_tokens":11}}\n\n',
+    )
+    assert usage == (7, 11)
+
+
+def test_cleanup_old_relay_logs_honors_retention_setting(client: TestClient) -> None:
+    set_setting(SettingRequest(key="relay_log_keep_period", value="1"))
+    set_setting(SettingRequest(key="relay_log_keep_enabled", value="true"))
+    with session_scope() as session:
+        session.add(
+            RelayLog(
+                id=1,
+                time=int(time.time()) - 3 * 86400,
+                request_model_name="old",
+                actual_model_name="old",
+            )
+        )
+    add_relay_log({"time": int(time.time()), "request_model_name": "new", "actual_model_name": "new"})
+
+    assert cleanup_old_relay_logs() == 1
+    names = [row["request_model_name"] for row in list_relay_logs(page=1, page_size=20)]
+    assert "old" not in names
+    assert "new" in names
