@@ -17,7 +17,7 @@
 ```bash
 cd octopus-python
 python -m venv .venv
-.venv\\Scripts\\activate
+.venv/Scripts/activate
 pip install -e .
 python -m octopus_python start
 ```
