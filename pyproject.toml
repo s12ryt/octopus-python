@@ -1,0 +1,39 @@
+[project]
+name = "octopus-python"
+version = "0.9.28.post1"
+description = "Python/FastAPI port of Octopus LLM API aggregation service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.30",
+    "pydantic>=2.7.0",
+    "bcrypt>=4.1.0",
+    "PyJWT>=2.8.0",
+    "httpx>=0.27.0",
+    "python-multipart>=0.0.9",
+    "pymysql>=1.1.1",
+    "psycopg[binary]>=3.1.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+octopus-python = "octopus_python.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
