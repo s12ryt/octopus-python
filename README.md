@@ -79,7 +79,8 @@ Python 版已將 Go 專案的 Web UI 建置後產物移植到 `static/out`，啟
 - Channel 更新保留明確傳入的 `0`/`false`，避免 `auto_group=0` 被誤寫成空字串。
 - 密碼雜湊使用 `bcrypt` 套件直接實作，避免 Python 3.14 + passlib/bcrypt 5 的相容性問題。
 - 串流 relay 已支援 SSE passthrough、首 token timeout 後切換下一個 channel、stream usage 解析與 relay log 補寫。
-- FastAPI lifespan 會啟動背景維護 task：模型價格補齊、channel 模型同步、relay log retention 清理。
+- FastAPI lifespan 會啟動背景維護 task：從 `models.dev` 自動抓取模型價格、channel 模型同步、relay log retention 清理。
+- 價格同步遵循「手動價格優先」：非 0 的使用者自訂價格不會被覆蓋，未定價或新 channel model 會自動補入 `models.dev` 價格。
 
 ## 注意
 

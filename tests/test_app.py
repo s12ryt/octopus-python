@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from octopus_python.app import create_app
 from octopus_python.config import AppConfig, DatabaseConfig, LogConfig, ServerConfig
-from octopus_python.database import APIKey, Channel, RelayLog, StatsHourly, close_db, init_db, session_scope
+from octopus_python.database import APIKey, Channel, LLMInfo, RelayLog, StatsHourly, close_db, init_db, session_scope
 from octopus_python.relay import merge_usage
 from octopus_python.schemas import ChannelCreateRequest, ChannelUpdateRequest, GroupCreateRequest, SettingRequest
 from octopus_python.services import (
@@ -21,10 +21,12 @@ from octopus_python.services import (
     init_services,
     issue_stream_token,
     list_relay_logs,
+    parse_models_dev_prices,
     record_usage,
     set_setting,
     today_str,
     update_channel,
+    update_model_prices,
 )
 
 
@@ -230,3 +232,57 @@ def test_cleanup_old_relay_logs_honors_retention_setting(client: TestClient) -> 
     names = [row["request_model_name"] for row in list_relay_logs(page=1, page_size=20)]
     assert "old" not in names
     assert "new" in names
+
+
+def test_parse_models_dev_prices_filters_supported_providers() -> None:
+    prices = parse_models_dev_prices(
+        {
+            "openai": {
+                "models": {
+                    "gpt-test": {
+                        "id": "GPT-Test",
+                        "cost": {"input": 1.25, "output": "2.5", "cache_read": 0.5, "cache_write": None},
+                    }
+                }
+            },
+            "unsupported": {"models": {"x": {"id": "x", "cost": {"input": 99}}}},
+        }
+    )
+    assert prices == {"gpt-test": {"input": 1.25, "output": 2.5, "cache_read": 0.5, "cache_write": 0.0}}
+
+
+def test_update_model_prices_uses_models_dev_without_overwriting_custom_price(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_fetch_prices() -> dict[str, dict[str, float]]:
+        return {
+            "gpt-priced": {"input": 1.0, "output": 2.0, "cache_read": 0.1, "cache_write": 0.2},
+            "custom-priced": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0},
+        }
+
+    monkeypatch.setattr("octopus_python.services.fetch_models_dev_prices", fake_fetch_prices)
+    create_channel(
+        ChannelCreateRequest(
+            name="priced",
+            type="openai/chat_completions",
+            model="gpt-priced",
+            keys=[{"channel_key": "sk-test", "enabled": True}],
+        )
+    )
+    with session_scope() as session:
+        session.add(LLMInfo(name="custom-priced", input=3.0, output=4.0, cache_read=0.0, cache_write=0.0))
+
+    asyncio.run(update_model_prices())
+
+    with session_scope() as session:
+        auto_price = session.get(LLMInfo, "gpt-priced")
+        custom_price = session.get(LLMInfo, "custom-priced")
+        assert auto_price is not None
+        assert (auto_price.input, auto_price.output, auto_price.cache_read, auto_price.cache_write) == (1.0, 2.0, 0.1, 0.2)
+        assert custom_price is not None
+        assert (custom_price.input, custom_price.output, custom_price.cache_read, custom_price.cache_write) == (
+            3.0,
+            4.0,
+            0.0,
+            0.0,
+        )

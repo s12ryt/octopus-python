@@ -69,6 +69,19 @@ NUMERIC_SETTINGS = {
 }
 
 SENSITIVE_HEADERS = {"authorization", "x-api-key", "api-key", "anthropic-api-key", "openai-api-key"}
+MODELS_DEV_PRICE_URL = "https://models.dev/api.json"
+MODELS_DEV_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "google",
+    "deepseek",
+    "xai",
+    "alibaba",
+    "zhipuai",
+    "minimax",
+    "moonshotai",
+    "v0",
+}
 CHANNEL_PATHS = {
     "openai/chat_completions": "/chat/completions",
     "openai/responses": "/responses",
@@ -87,6 +100,7 @@ sticky_sessions: dict[str, tuple[int, int, float]] = {}
 circuit_breakers: dict[str, dict[str, Any]] = {}
 background_tasks: set[asyncio.Task[Any]] = set()
 background_stop_event: asyncio.Event | None = None
+llm_price_cache: dict[str, dict[str, float]] = {}
 
 
 def _normalize_base_url(base_url: str, suffix: str = "v1") -> str:
@@ -451,7 +465,16 @@ def create_missing_prices(session: Session, names: Iterable[str]) -> None:
         if not key:
             continue
         if session.get(LLMInfo, key) is None:
-            session.add(LLMInfo(name=key))
+            price = llm_price_cache.get(key) or {}
+            session.add(
+                LLMInfo(
+                    name=key,
+                    input=float(price.get("input") or 0),
+                    output=float(price.get("output") or 0),
+                    cache_read=float(price.get("cache_read") or 0),
+                    cache_write=float(price.get("cache_write") or 0),
+                )
+            )
 
 
 def auto_group_channel(session: Session, channel: Channel) -> None:
@@ -752,13 +775,81 @@ def list_llm_channels() -> list[dict[str, Any]]:
         return out
 
 
+def _float_price(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_models_dev_prices(payload: dict[str, Any]) -> dict[str, dict[str, float]]:
+    prices: dict[str, dict[str, float]] = {}
+    for provider in MODELS_DEV_PROVIDERS:
+        provider_data = payload.get(provider)
+        if not isinstance(provider_data, dict):
+            continue
+        models = provider_data.get("models")
+        if not isinstance(models, dict):
+            continue
+        for fallback_name, raw_model in models.items():
+            if not isinstance(raw_model, dict):
+                continue
+            name = str(raw_model.get("id") or fallback_name).strip().lower()
+            cost = raw_model.get("cost")
+            if not name or not isinstance(cost, dict):
+                continue
+            prices[name] = {
+                "input": _float_price(cost.get("input")),
+                "output": _float_price(cost.get("output")),
+                "cache_read": _float_price(cost.get("cache_read")),
+                "cache_write": _float_price(cost.get("cache_write")),
+            }
+    return prices
+
+
+async def fetch_models_dev_prices() -> dict[str, dict[str, float]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Octopus-Python/1.0"
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(MODELS_DEV_PRICE_URL, headers=headers)
+        response.raise_for_status()
+        return parse_models_dev_prices(response.json())
+
+
+def _has_nonzero_price(item: LLMInfo) -> bool:
+    return bool((item.input or 0) or (item.output or 0) or (item.cache_read or 0) or (item.cache_write or 0))
+
+
+def _apply_cached_price(item: LLMInfo, price: dict[str, float]) -> None:
+    item.input = float(price.get("input") or 0)
+    item.output = float(price.get("output") or 0)
+    item.cache_read = float(price.get("cache_read") or 0)
+    item.cache_write = float(price.get("cache_write") or 0)
+
+
 async def update_model_prices() -> None:
     global last_model_update_time
-    # Best-effort lightweight sync: create missing prices for configured channel models.
+    global llm_price_cache
+    fetched_prices = await fetch_models_dev_prices()
+    if fetched_prices:
+        llm_price_cache = fetched_prices
+
+    # Go 版價格來源優先順序：使用者在價格頁自訂 > models.dev 自動同步。
+    # Python 版沒有單獨的 Go in-memory price map，因此把 models.dev 價格補進：
+    # 1. 新增 channel model 時直接帶入價格。
+    # 2. 既有全 0 價格列視為自動 placeholder，可被 models.dev 補齊。
+    # 3. 既有非 0 價格列視為使用者自訂，不覆蓋。
     with session_scope() as session:
         channels = session.scalars(select(Channel)).all()
         for ch in channels:
             create_missing_prices(session, _model_names_from_channel(ch))
+        for item in session.scalars(select(LLMInfo)).all():
+            price = llm_price_cache.get(item.name.lower())
+            if price and not _has_nonzero_price(item):
+                _apply_cached_price(item, price)
     last_model_update_time = iso_now()
 
 
